@@ -1,0 +1,46 @@
+services:
+  warehouse:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${WH_USER}
+      POSTGRES_PASSWORD: ${WH_PASSWORD}
+      POSTGRES_DB: ${WH_DB}
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - wh_data:/var/lib/postgresql/data
+    ports: ["5433:5432"]
+
+  airflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - af_data:/var/lib/postgresql/data
+
+  airflow:
+    image: apache/airflow:2.9.3
+    command: standalone
+    depends_on: [airflow-db, warehouse]
+    env_file: .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _PIP_ADDITIONAL_REQUIREMENTS: requests beautifulsoup4 psycopg2-binary pandas
+    volumes:
+      - ./dags:/opt/airflow/dags
+    ports: ["8080:8080"]
+
+  web:
+    build: ./web
+    depends_on: [warehouse]
+    env_file: .env
+    environment:
+      WH_HOST: warehouse
+    ports: ["8501:8501"]
+
+volumes:
+  wh_data:
+  af_data:
