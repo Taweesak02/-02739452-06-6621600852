@@ -21,20 +21,28 @@ services:
 
   airflow:
     image: apache/airflow:2.9.3
-    command: standalone
-    depends_on: [airflow-db, warehouse]
+    depends_on:
+      - airflow-db
+      - warehouse
     env_file: .env
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      _AIRFLOW_WWW_USER_USERNAME: admin
-      _AIRFLOW_WWW_USER_PASSWORD: airflow
+
+      AIRFLOW_ADMIN_USERNAME: ${AIRFLOW_ADMIN_USERNAME}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+
       _PIP_ADDITIONAL_REQUIREMENTS: requests beautifulsoup4 psycopg2-binary pandas
+
     volumes:
       - ./dags:/opt/airflow/dags
-    ports: ["8080:8080"]
+      - ./airflow-entrypoint.sh:/airflow-entrypoint.sh
 
+    entrypoint: ["/bin/bash", "/airflow-entrypoint.sh"]
+
+    ports:
+      - "8080:8080"
   web:
     build: ./web
     depends_on: [warehouse]

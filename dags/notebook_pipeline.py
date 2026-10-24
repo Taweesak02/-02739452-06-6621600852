@@ -1,18 +1,16 @@
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.robotparser import RobotFileParser
 
 import psycopg2
-from datetime import timedelta
 import requests
 from airflow.decorators import dag, task, task_group
 from bs4 import BeautifulSoup
 from psycopg2.extras import execute_values
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
 
 UA = "Mozilla/5.0 (compatible; KU-Student-Project/1.0)"
 PRICE_MIN, PRICE_MAX = 5000, 30000
@@ -27,7 +25,7 @@ BRANDS = [("ThinkPad", "Lenovo"), ("IdeaPad", "Lenovo"), ("Lenovo", "Lenovo"),
           ("Surface", "Microsoft"), ("Samsung", "Samsung"), ("Huawei", "Huawei")]
 
 
-# ---------- helpers ----------
+# ---------------------------------------------------------------- helpers
 def make_session():
     s = requests.Session()
     s.headers["User-Agent"] = UA
@@ -38,6 +36,7 @@ def make_session():
 
 
 def check_robots(base, url):
+    """ตรวจ robots.txt ของโดเมนนั้นก่อนดึงข้อมูล"""
     r = make_session().get(base + "/robots.txt", timeout=(5, 30))
     if r.status_code == 200:
         rp = RobotFileParser()
@@ -45,41 +44,53 @@ def check_robots(base, url):
         if not rp.can_fetch(UA, url):
             raise RuntimeError(f"robots.txt ไม่อนุญาต: {url}")
     elif r.status_code in (401, 403):
-        raise RuntimeError(f"อ่าน robots.txt ไม่ได้ ({r.status_code})")
+        raise RuntimeError(f"อ่าน robots.txt ไม่ได้ ({r.status_code}): {base}")
 
 
-def parse_specs(title):
+def _to_gb(n, unit):
+    n = int(n)
+    if unit:
+        return n * 1024 if unit.upper() == "TB" else n
+    return n * 1024 if n in (1, 2, 4) else n  # SSD1 / SSD2 มักหมายถึง TB
+
+
+def parse_specs(text):
     brand = next((b for k, b in BRANDS
-                  if re.search(rf"\b{k}\b", title, re.I)), "Other")
-    m = re.search(r"(Core Ultra \d|\bi[3579]\b|Ryzen \d|Xeon|\bM[1-4]\b)", title, re.I)
-    sizes = [int(n) * (1024 if u.upper() == "TB" else 1)
-             for n, u in re.findall(r"(\d+)\s*(GB|TB)", title, re.I)]
-    r = re.search(r"RAM\s*(\d+)\s*GB|(\d+)\s*GB\s*(?:DDR\d\s*)?RAM", title, re.I)
-    if r:
-        ram = int(r.group(1) or r.group(2))
-    else:
-        ram = next((s for s in sizes if s <= 64), None)
-    rest = list(sizes)
-    if ram in rest:
-        rest.remove(ram)
-    storage = next((s for s in rest if s >= 32), None)
+                  if re.search(rf"\b{k}\b", text, re.I)), "Other")
+    m = re.search(r"(Core\s*Ultra\s*\d|\bi[3579]\b|Ryzen\s*\d|Ryzen\W*AI\W*\d|Xeon|\bM[1-4]\b)", text, re.I)
+
+    r = re.search(r"RAM\W{0,4}(\d{1,3})(?!\d)|(\d{1,3})\s*GB\s*(?:DDR\d\s*)?RAM", text, re.I)
+    ram = int(r.group(1) or r.group(2)) if r else None
+    s = re.search(r"(?:SSD|HDD|M\.2)\W{0,4}(\d{1,4})\s*(TB|GB)?(?!\d)", text, re.I)
+    storage = _to_gb(s.group(1), s.group(2)) if s else None
+
+    if ram is None or storage is None:  # สำรอง: ดูจากตัวเลขที่มีหน่วย GB/TB
+        sizes = [int(n) * (1024 if u.upper() == "TB" else 1)
+                 for n, u in re.findall(r"(\d+)\s*(GB|TB)", text, re.I)]
+        if ram is None:
+            ram = next((x for x in sizes if x <= 64), None)
+        rest = list(sizes)
+        if ram in rest:
+            rest.remove(ram)
+        if storage is None:
+            storage = next((x for x in rest if x >= 32), None)
     return {"brand": brand, "cpu": m.group(1) if m else None,
             "ram_gb": ram, "storage_gb": storage}
 
 
-# ---------- Talata ----------
+# ---------------------------------------------------------------- Talata
 TL_BASE = "https://talata.co.th"
 TL_LIST = TL_BASE + "/en/categories/electronics/laptops"
 
 
 @task
 def extract_talata():
-    session = make_session()
     check_robots(TL_BASE, TL_LIST)
+    session = make_session()
     found = {}
     for page in range(1, 7):
         r = session.get(TL_LIST, params={"page": page}, timeout=(5, 30))
-        if r.status_code == 404:      # เกินหน้าสุดท้ายแล้ว
+        if r.status_code == 404:  # เกินหน้าสุดท้าย
             break
         r.raise_for_status()
         anchors = BeautifulSoup(r.text, "html.parser").select('a[href*="/listing/"]')
@@ -117,7 +128,7 @@ def transform_talata(raw):
     return list(rows.values())
 
 
-# ---------- S Sale Com ----------
+# ---------------------------------------------------------------- S Sale Com
 SS_BASE = "https://s-salecom.com"
 SS_LIST = SS_BASE + "/product-category/notebook/"
 SS_PARAMS = {"min_price": PRICE_MIN, "max_price": PRICE_MAX,
@@ -128,11 +139,11 @@ PRICE_RE = re.compile(r"([\d,]+)\s*บาท")
 @task
 def extract_ssale():
     check_robots(SS_BASE, SS_LIST)
+    session = make_session()
     found = {}
     for page in range(1, 21):
-        session = make_session()
         url = SS_LIST if page == 1 else f"{SS_LIST}page/{page}/"
-        r = session.get(TL_LIST, params={"page": page}, timeout=(5, 30))
+        r = session.get(url, params=SS_PARAMS, timeout=(5, 30))
         if r.status_code == 404:
             break
         r.raise_for_status()
@@ -174,10 +185,89 @@ def transform_ssale(raw):
     return list(rows.values())
 
 
-# ---------- load ----------
+# ---------------------------------------------------------------- Notebook Station
+NB_BASE = "https://www.notebooknbst.com"
+NB_LIST = (NB_BASE + "/category/2983/"
+           "%E0%B9%82%E0%B8%99%E0%B9%8A%E0%B8%95%E0%B8%9A%E0%B8%B8%E0%B9%8A%E0%B8%84"
+           "%E0%B8%A1%E0%B8%B7%E0%B8%AD%E0%B8%AA%E0%B8%AD%E0%B8%87")
+NB_PRICE_RE = re.compile(r"([\d,]+)\s*THB")
+
+
+def _nb_card(a):
+    """ไต่ขึ้นหา element การ์ดสินค้าที่มีราคา โดยไม่ข้ามไปรวมสินค้าชิ้นอื่น"""
+    node = a
+    for _ in range(8):
+        node = node.parent
+        if node is None:
+            return None
+        hrefs = {x["href"] for x in node.select('a[href*="/product/"]')}
+        if len(hrefs) > 1:
+            return None
+        if "THB" in node.get_text(" ", strip=True):
+            return node
+    return None
+
+
 @task
-def load(talata_rows, ssale_rows):
-    rows = talata_rows + ssale_rows
+def extract_nbst():
+    check_robots(NB_BASE, NB_LIST)
+    session = make_session()
+    found = {}
+    for page in range(1, 6):
+        r = session.get(NB_LIST, params={"p": page}, timeout=(5, 30))
+        if r.status_code == 404:
+            break
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        n_before = len(found)
+        for a in soup.select('a[href*="/product/"]'):
+            title = a.get_text(" ", strip=True)
+            if not title:  # ลิงก์ที่มีแต่รูป
+                continue
+            card = _nb_card(a)
+            if card is None:
+                continue
+            text = card.get_text(" ", strip=True)
+            prices = NB_PRICE_RE.findall(text)
+            if not prices:
+                continue
+            code = re.search(r"\bNB\d{5}\b", text)
+            pid = re.search(r"/product/([\d-]+)/", a["href"])
+            lid = code.group(0) if code else (pid.group(1) if pid else None)
+            if not lid:
+                continue
+            found[lid] = {"listing_id": lid, "url": a["href"], "title": title,
+                          "price": int(prices[-1].replace(",", ""))}  # ราคาสุดท้าย = ราคาหลังลด
+        if len(found) == n_before:  # ไม่มีรายการใหม่ (หมดหน้า)
+            break
+        time.sleep(1.5)
+    return list(found.values())
+
+
+@task
+def transform_nbst(raw):
+    rows = {}
+    for item in raw:
+        if not (PRICE_MIN <= item["price"] <= PRICE_MAX):
+            continue
+        rows[item["listing_id"]] = {
+            "source": "notebookstation", "listing_id": item["listing_id"],
+            "url": item["url"], "title": item["title"], "price": item["price"],
+            "province": None, "condition": "Used", **parse_specs(item["title"])}
+    return list(rows.values())
+
+
+# ---------------------------------------------------------------- load
+@task(trigger_rule="all_done")  # รันต่อแม้บางแหล่งล้ม (ทนต่อแหล่งที่ล่ม)
+def load(talata_rows=None, ssale_rows=None, nbst_rows=None):
+    sources = {"talata": talata_rows or [], "ssalecom": ssale_rows or [],
+               "notebookstation": nbst_rows or []}
+    for name, rows in sources.items():
+        print(f"{name}: {len(rows)} rows")
+    rows = [r for rs in sources.values() for r in rs]
+    if not rows:
+        raise RuntimeError("ไม่มีข้อมูลจากทุกแหล่ง")
+
     conn = psycopg2.connect(host=os.getenv("WH_HOST", "warehouse"),
                             dbname=os.environ["WH_DB"],
                             user=os.environ["WH_USER"],
@@ -191,7 +281,7 @@ def load(talata_rows, ssale_rows):
     conn.close()
 
 
-# ---------- DAG ----------
+# ---------------------------------------------------------------- DAG
 @dag(dag_id="notebook_pipeline", start_date=datetime(2026, 1, 1),
      schedule=None, catchup=False,
      default_args={"retries": 2, "retry_delay": timedelta(seconds=30)})
@@ -204,7 +294,11 @@ def notebook_pipeline():
     def ssalecom():
         return transform_ssale(extract_ssale())
 
-    load(talata(), ssalecom())
+    @task_group(group_id="notebookstation")
+    def notebookstation():
+        return transform_nbst(extract_nbst())
+
+    load(talata(), ssalecom(), notebookstation())
 
 
 notebook_pipeline()
